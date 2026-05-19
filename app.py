@@ -7,6 +7,7 @@ from db import query, execute, init_tables, load_users, IntegrityError
 
 app = Flask(__name__)
 app.secret_key = 'ezetec_super_secret_key_2025'
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 
 init_tables()
 
@@ -136,7 +137,8 @@ HTML_TEMPLATE = '''
         <div style="display: flex; align-items: center; gap: 10px;">
             <button id="themeToggle" onclick="toggleTheme()">🌙 Modo Noturno</button>
             <a href="/backup/download" class="btn-primary" style="width: auto; padding: 8px 20px; background: #0f9d58; text-decoration: none;">📥 Baixar Backup</a>
-            <button class="btn-primary" style="width: auto; padding: 8px 20px; background: #4285f4;" onclick="document.getElementById('modalImport').style.display='block'">📤 Importar JSON</button>
+            <button class="btn-primary" style="width: auto; padding: 8px 20px; background: #4285f4;" onclick="document.getElementById('modalImport').style.display='block'">📤 Importar</button>
+            <button class="btn-primary" style="width: auto; padding: 8px 20px; background: #f4b400; color: #202124;" onclick="document.getElementById('modalRestore').style.display='block'">🔄 Restaurar</button>
             <div style="font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
                 <span>👤 {{ session['username'] }}</span>
                 {% if session.get('role') == 'admin' %}
@@ -385,10 +387,13 @@ HTML_TEMPLATE = '''
     <div id="modalImport" class="modal">
         <div class="modal-content">
             <h3>Importar Dados via JSON</h3>
+            <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 15px;">
+                Aceita formatos antigos e novos. O sistema detecta automaticamente.
+            </p>
             <form action="/import" method="POST">
                 <div class="form-group">
                     <label>Cole o JSON aqui:</label>
-                    <textarea name="json_data" class="fixed-size" style="height:150px;" placeholder='[{"nome":"...","telefone":"...",...}]'></textarea>
+                    <textarea name="json_data" class="fixed-size" style="height:150px;" placeholder='Cole o JSON de qualquer formato...'></textarea>
                 </div>
                 <button type="submit" class="btn-primary">IMPORTAR</button>
                 <button type="button" class="btn-primary" style="background:#5f6368; margin-top:10px;" onclick="document.getElementById('modalImport').style.display='none'">Cancelar</button>
@@ -408,6 +413,27 @@ HTML_TEMPLATE = '''
                 <button type="button" class="btn-primary" style="background: #25d366;" onclick="enviarWhatsApp()">📤 Enviar via WhatsApp</button>
                 <button type="button" class="btn-primary" style="background: #5f6368;" onclick="document.getElementById('modalWhatsApp').style.display='none'">Cancelar</button>
             </div>
+        </div>
+    </div>
+
+    <!-- MODAL RESTAURAR BACKUP -->
+    <div id="modalRestore" class="modal">
+        <div class="modal-content">
+            <h3 style="border-bottom: 2px solid #f4b400; padding-bottom: 8px; margin-top:0;">🔄 Restaurar Backup</h3>
+            <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 15px;">
+                Aceita arquivos JSON de qualquer formato (backup antigo, exportação de outros sistemas, etc.).
+                O sistema detecta automaticamente o formato e mapeia os campos.
+            </p>
+            <form action="/restore" method="POST" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label>Selecione o arquivo JSON:</label>
+                    <input type="file" name="backup_file" accept=".json" required style="padding: 10px;">
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button type="submit" class="btn-primary" style="background: #f4b400; color: #202124;">🔄 RESTAURAR</button>
+                    <button type="button" class="btn-primary" style="background:#5f6368;" onclick="document.getElementById('modalRestore').style.display='none'">Cancelar</button>
+                </div>
+            </form>
         </div>
     </div>
 
@@ -751,6 +777,113 @@ USERS_HTML = '''
 </html>
 '''
 
+# --- FUNÇÃO DE MAPEAMENTO DE FORMATOS DE BACKUP ---
+def map_ordem_record(reg):
+    """Detecta automaticamente o formato do registro e mapeia para o schema atual."""
+    mapeado = {}
+    
+    # Formato novo (nome/telefone) - retorna direto
+    if 'nome' in reg and 'telefone' in reg:
+        mapeado = {
+            'nome': reg.get('nome', 'Sem nome'),
+            'telefone': reg.get('telefone', ''),
+            'aparelho': reg.get('aparelho', ''),
+            'marca': reg.get('marca', ''),
+            'modelo': reg.get('modelo', ''),
+            'defeito_relatado': reg.get('defeito_relatado', reg.get('defeito', '')),
+            'estado_entrada': reg.get('estado_entrada', ''),
+            'observacao': reg.get('observacao', reg.get('observacoes', '')),
+            'defeito_encontrado': reg.get('defeito_encontrado', reg.get('servico', '')),
+            'valor_conserto': reg.get('valor_conserto', reg.get('maoDeObra', 0)),
+            'valor_pecas': reg.get('valor_pecas', 0),
+            'tecnico_responsavel': reg.get('tecnico_responsavel', ''),
+            'status_retirada': reg.get('status_retirada', 'Na Loja'),
+            'data_entrada': reg.get('data_entrada', datetime.now().strftime('%Y-%m-%d')),
+            'data_saida': reg.get('data_saida', '')
+        }
+        return mapeado
+    
+    # Formato antigo (cliente/whatsapp)
+    if 'cliente' in reg:
+        status = reg.get('status', 'Aberta')
+        status_map = {'Aberta': 'Na Loja', 'Fechada': 'Entregue', 'Entregue': 'Entregue',
+                      'Cancelada': 'Abandonado', 'Na Loja': 'Na Loja'}
+        data_raw = reg.get('createdAt', '')
+        data_entrada = data_raw[:10] if data_raw and len(data_raw) >= 10 else datetime.now().strftime('%Y-%m-%d')
+        
+        valor = reg.get('maoDeObra', '0') or reg.get('valorTotal', '0') or '0'
+        try:
+            valor = float(valor.replace('R$', '').replace(',', '.').strip())
+        except (ValueError, AttributeError):
+            valor = 0.0
+        
+        telefone = reg.get('whatsapp', '')
+        telefone = re.sub(r'\D', '', telefone)
+        
+        mapeado = {
+            'nome': reg.get('cliente', 'Sem nome'),
+            'telefone': telefone,
+            'aparelho': reg.get('aparelho', ''),
+            'marca': reg.get('marca', ''),
+            'modelo': reg.get('modelo', ''),
+            'defeito_relatado': reg.get('defeito', reg.get('defeito_relatado', '')),
+            'estado_entrada': reg.get('estado_entrada', ''),
+            'observacao': reg.get('observacoes', reg.get('observacao', '')),
+            'defeito_encontrado': reg.get('servico', reg.get('defeito_encontrado', '')),
+            'valor_conserto': valor,
+            'valor_pecas': 0.0,
+            'tecnico_responsavel': reg.get('tecnico_responsavel', ''),
+            'status_retirada': status_map.get(status, 'Na Loja'),
+            'data_entrada': data_entrada,
+            'data_saida': ''
+        }
+        return mapeado
+    
+    # Fallback: tenta usar o que tiver disponível
+    mapeado = {
+        'nome': reg.get('nome', reg.get('cliente', reg.get('nome_cliente', 'Sem nome'))),
+        'telefone': reg.get('telefone', reg.get('whatsapp', reg.get('tel', reg.get('fone', '')))),
+        'aparelho': reg.get('aparelho', reg.get('equipamento', reg.get('produto', ''))),
+        'marca': reg.get('marca', ''),
+        'modelo': reg.get('modelo', ''),
+        'defeito_relatado': reg.get('defeito_relatado', reg.get('defeito', reg.get('problema', ''))),
+        'estado_entrada': reg.get('estado_entrada', reg.get('avarias', '')),
+        'observacao': reg.get('observacao', reg.get('observacoes', reg.get('obs', ''))),
+        'defeito_encontrado': reg.get('defeito_encontrado', reg.get('servico', reg.get('diagnostico', ''))),
+        'valor_conserto': reg.get('valor_conserto', reg.get('maoDeObra', reg.get('valor', 0))),
+        'valor_pecas': reg.get('valor_pecas', reg.get('pecas', 0)),
+        'tecnico_responsavel': reg.get('tecnico_responsavel', reg.get('tecnico', '')),
+        'status_retirada': reg.get('status_retirada', reg.get('status', 'Na Loja')),
+        'data_entrada': reg.get('data_entrada', reg.get('createdAt', reg.get('data', datetime.now().strftime('%Y-%m-%d')))),
+        'data_saida': reg.get('data_saida', reg.get('updatedAt', ''))
+    }
+    # Limpar data_entrada (pegar só YYYY-MM-DD)
+    de = mapeado['data_entrada']
+    if de and isinstance(de, str) and len(de) >= 10:
+        mapeado['data_entrada'] = de[:10]
+    elif not de:
+        mapeado['data_entrada'] = datetime.now().strftime('%Y-%m-%d')
+    
+    return mapeado
+
+
+def detectar_registros(data):
+    """Extrai lista de registros de qualquer formato de backup."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        if 'ordens' in data:
+            return data['ordens']
+        if 'ordens_servico' in data:
+            return data['ordens_servico']
+        if 'clientes' in data:
+            return data['clientes']
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+    return []
+
+
 # --- ROTAS DO SISTEMA ---
 @app.route('/')
 def index():
@@ -867,41 +1000,74 @@ def update():
 def import_json():
     data = request.form.get('json_data', '')
     try:
-        registros = json.loads(data)
-        if not isinstance(registros, list):
-            raise ValueError("JSON deve ser uma lista de objetos")
+        parsed = json.loads(data)
+        registros = detectar_registros(parsed)
+        if not registros:
+            flash('Nenhum registro encontrado no JSON.', 'error')
+            return redirect(url_for('index'))
         
         inseridos = 0
         for reg in registros:
-            nome = reg.get('nome', 'Sem nome')
-            telefone = reg.get('telefone', '')
-            aparelho = reg.get('aparelho', '')
-            marca = reg.get('marca', '')
-            modelo = reg.get('modelo', '')
-            defeito_relatado = reg.get('defeito_relatado', '')
-            estado_entrada = reg.get('estado_entrada', '')
-            observacao = reg.get('observacao', '')
-            status_retirada = reg.get('status_retirada', 'Na Loja')
-            data_entrada = reg.get('data_entrada', datetime.now().strftime('%Y-%m-%d'))
-            defeito_encontrado = reg.get('defeito_encontrado', '')
-            valor_conserto = reg.get('valor_conserto', 0)
-            valor_pecas = reg.get('valor_pecas', 0)
-            tecnico = reg.get('tecnico_responsavel', '')
-            data_saida = reg.get('data_saida', '')
-            
+            m = map_ordem_record(reg)
             execute('''INSERT INTO ordens_servico 
                 (nome, telefone, aparelho, marca, modelo, defeito_relatado, estado_entrada, observacao,
                  status_retirada, data_entrada, defeito_encontrado, valor_conserto, valor_pecas,
                  tecnico_responsavel, data_saida)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (nome, telefone, aparelho, marca, modelo, defeito_relatado, estado_entrada, observacao,
-                 status_retirada, data_entrada, defeito_encontrado, valor_conserto, valor_pecas,
-                 tecnico, data_saida))
+                (m['nome'], m['telefone'], m['aparelho'], m['marca'], m['modelo'],
+                 m['defeito_relatado'], m['estado_entrada'], m['observacao'],
+                 m['status_retirada'], m['data_entrada'], m['defeito_encontrado'],
+                 m['valor_conserto'], m['valor_pecas'], m['tecnico_responsavel'], m['data_saida']))
             inseridos += 1
         
-        flash(f'{inseridos} registros importados com sucesso!', 'success')
+        flash(f'{inseridos} registros importados com sucesso! (formato detectado automaticamente)', 'success')
     except Exception as e:
         flash(f'Erro na importação: {str(e)}', 'error')
+    return redirect(url_for('index'))
+
+@app.route('/restore', methods=['POST'])
+def restore_backup():
+    if 'backup_file' not in request.files:
+        flash('Nenhum arquivo enviado.', 'error')
+        return redirect(url_for('index'))
+    
+    file = request.files['backup_file']
+    if file.filename == '':
+        flash('Nenhum arquivo selecionado.', 'error')
+        return redirect(url_for('index'))
+    
+    try:
+        content = file.read().decode('utf-8')
+        parsed = json.loads(content)
+        registros = detectar_registros(parsed)
+        
+        if not registros:
+            flash('Nenhum registro encontrado no arquivo.', 'error')
+            return redirect(url_for('index'))
+        
+        inseridos = 0
+        erros = 0
+        for reg in registros:
+            try:
+                m = map_ordem_record(reg)
+                execute('''INSERT INTO ordens_servico 
+                    (nome, telefone, aparelho, marca, modelo, defeito_relatado, estado_entrada, observacao,
+                     status_retirada, data_entrada, defeito_encontrado, valor_conserto, valor_pecas,
+                     tecnico_responsavel, data_saida)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (m['nome'], m['telefone'], m['aparelho'], m['marca'], m['modelo'],
+                     m['defeito_relatado'], m['estado_entrada'], m['observacao'],
+                     m['status_retirada'], m['data_entrada'], m['defeito_encontrado'],
+                     m['valor_conserto'], m['valor_pecas'], m['tecnico_responsavel'], m['data_saida']))
+                inseridos += 1
+            except Exception:
+                erros += 1
+        
+        nome_arquivo = file.filename
+        flash(f'Backup "{nome_arquivo}" restaurado: {inseridos} registros importados' +
+              (f', {erros} erros' if erros else '') + '!', 'success')
+    except Exception as e:
+        flash(f'Erro ao restaurar backup: {str(e)}', 'error')
     return redirect(url_for('index'))
 
 @app.route('/backup/download')
